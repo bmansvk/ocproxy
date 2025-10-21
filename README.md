@@ -13,6 +13,7 @@ Basic usage
 Commonly used options include:
 
       -D port                   Set up a SOCKS5 server on PORT
+      -H port                   Set up an HTTP proxy server on PORT
       -L lport:rhost:rport      Connections to localhost:LPORT will be redirected
                                 over the VPN to RHOST:RPORT
       -g                        Allow non-local clients.
@@ -26,9 +27,15 @@ openconnect using the --script-tun option:
         "./ocproxy -L 2222:unix-host:22 -L 3389:win-host:3389 -D 11080" \
         vpn.example.com
 
+You can also use the HTTP proxy with `-H`:
+
+    openconnect --script-tun --script \
+        "./ocproxy -H 8080 -D 11080" \
+        vpn.example.com
+
 Once ocproxy is running, connections can be established over the VPN link
 by connecting directly to a forwarded port or by utilizing the builtin
-SOCKS server:
+SOCKS or HTTP proxy servers:
 
     ssh -p2222 localhost
     rdesktop localhost
@@ -37,6 +44,21 @@ SOCKS server:
     ...
 
 OpenConnect can (and should) be run as a non-root user when using ocproxy.
+
+
+Using the HTTP proxy
+---------------------
+
+The HTTP proxy supports the CONNECT method for tunneling HTTPS connections.
+You can configure your browser or other applications to use the HTTP proxy
+for both HTTP and HTTPS connections.
+
+To configure the HTTP proxy in your browser:
+- Set HTTP proxy to 127.0.0.1 port 8080 (or the port specified with -H)
+- Set HTTPS proxy to the same address and port
+
+The HTTP proxy can be used alongside the SOCKS5 proxy. Some applications
+may work better with HTTP proxy (browsers), while others may prefer SOCKS5.
 
 
 Using the SOCKS5 proxy

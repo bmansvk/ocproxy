@@ -61,6 +61,7 @@ enum {
 	STATE_NEW		= 0,
 	STATE_SOCKS_AUTH,
 	STATE_SOCKS_CMD,
+	STATE_HTTP_REQ,
 	STATE_DNS,
 	STATE_CONNECTING,
 	STATE_DATA,
@@ -70,6 +71,7 @@ enum {
 
 #define CONN_TYPE_REDIR		0
 #define CONN_TYPE_SOCKS		1
+#define CONN_TYPE_HTTP		2
 
 #define SOCKBUF_LEN		2048
 
@@ -480,6 +482,153 @@ disconnect:
 }
 
 /**********************************************************************
+ * HTTP proxy protocol
+ **********************************************************************/
+
+static void http_send_error(struct ocp_sock *s, const char *status, const char *msg)
+{
+	char buf[512];
+	int len;
+
+	len = snprintf(buf, sizeof(buf),
+		       "HTTP/1.1 %s\r\n"
+		       "Content-Type: text/plain\r\n"
+		       "Connection: close\r\n"
+		       "\r\n"
+		       "%s\r\n", status, msg);
+
+	if (write(s->fd, buf, len) != len)
+		; /* ignore error */
+	ocp_sock_del(s);
+}
+
+static void http_send_connect_ok(struct ocp_sock *s)
+{
+	const char *response = "HTTP/1.1 200 Connection established\r\n\r\n";
+	int len = strlen(response);
+
+	if (write(s->fd, response, len) != len) {
+		ocp_sock_del(s);
+		return;
+	}
+
+	s->state = STATE_DATA;
+	event_add(s->ev, NULL);
+	tcp_recv(s->tpcb, recv_cb);
+	tcp_sent(s->tpcb, sent_cb);
+}
+
+/* Called when lwIP tcp_connect() is successful for HTTP CONNECT */
+static err_t http_connect_cb(void *arg, struct tcp_pcb *tpcb, err_t err)
+{
+	struct ocp_sock *s = arg;
+
+	http_send_connect_ok(s);
+	return ERR_OK;
+}
+
+static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
+{
+	struct ocp_sock *s = ctx;
+	ssize_t ret;
+	char *line_end, *method, *url, *host_start, *port_str;
+	char hostname[256];
+	int is_connect = 0;
+
+	if (s->state == STATE_DATA) {
+		/* HTTP CONNECT tunnel established, pass data */
+		local_data_cb(fd, what, ctx);
+		return;
+	}
+
+	ret = read(s->fd, s->sockbuf + s->sock_pos, SOCKBUF_LEN - s->sock_pos - 1);
+	if (ret <= 0)
+		goto disconnect;
+
+	s->sock_pos += ret;
+	s->sockbuf[s->sock_pos] = '\0';
+
+	/* Look for end of HTTP request line */
+	line_end = strstr(s->sockbuf, "\r\n");
+	if (!line_end) {
+		if (s->sock_pos >= SOCKBUF_LEN - 1) {
+			http_send_error(s, "400 Bad Request", "Request too long");
+			return;
+		}
+		event_add(s->ev, NULL);
+		return;
+	}
+
+	*line_end = '\0';
+
+	/* Parse request: METHOD URL HTTP/1.x */
+	method = s->sockbuf;
+	url = strchr(method, ' ');
+	if (!url) {
+		http_send_error(s, "400 Bad Request", "Invalid request");
+		return;
+	}
+	*url++ = '\0';
+
+	/* Skip whitespace */
+	while (*url == ' ')
+		url++;
+
+	char *http_ver = strchr(url, ' ');
+	if (!http_ver) {
+		http_send_error(s, "400 Bad Request", "Invalid request");
+		return;
+	}
+	*http_ver = '\0';
+
+	/* Check if this is a CONNECT request */
+	if (strcasecmp(method, "CONNECT") == 0) {
+		is_connect = 1;
+		/* CONNECT format: hostname:port */
+		host_start = url;
+	} else {
+		/* Regular HTTP request - not supported in this simple implementation */
+		http_send_error(s, "501 Not Implemented",
+				"Only CONNECT method is supported");
+		return;
+	}
+
+	/* Parse hostname:port */
+	port_str = strchr(host_start, ':');
+	if (!port_str) {
+		http_send_error(s, "400 Bad Request", "Missing port in CONNECT");
+		return;
+	}
+	*port_str++ = '\0';
+
+	/* Copy hostname */
+	strncpy(hostname, host_start, sizeof(hostname) - 1);
+	hostname[sizeof(hostname) - 1] = '\0';
+
+	/* Parse port */
+	s->rport = ocp_atoi(port_str);
+	if (s->rport <= 0 || s->rport > 65535) {
+		http_send_error(s, "400 Bad Request", "Invalid port");
+		return;
+	}
+
+	/* Check if it's an IP address or needs DNS resolution */
+	ip_addr_t ip;
+	if (ipaddr_aton(hostname, &ip)) {
+		/* Direct IP connection */
+		start_connection(s, &ip);
+	} else {
+		/* DNS resolution needed */
+		start_resolution(s, hostname);
+	}
+
+	return;
+
+disconnect:
+	ocp_sock_del(s);
+}
+
+/**********************************************************************
  * Connection setup
  **********************************************************************/
 
@@ -493,6 +642,9 @@ static void tcp_err_cb(void *arg, err_t err)
 		if (s->state == STATE_CONNECTING &&
 		    s->conn_type == CONN_TYPE_SOCKS)
 			socks_reply(s, SOCKS_CONNREFUSED);
+		else if (s->state == STATE_CONNECTING &&
+			 s->conn_type == CONN_TYPE_HTTP)
+			http_send_error(s, "502 Bad Gateway", "Connection failed");
 		else
 			ocp_sock_del(s);
 	}
@@ -518,6 +670,7 @@ static void start_connection(struct ocp_sock *s, ip_addr_t *ipaddr)
 {
 	struct tcp_pcb *tpcb;
 	err_t err;
+	tcp_connected_fn connected_cb;
 
 	s->state = STATE_CONNECTING;
 
@@ -536,7 +689,10 @@ static void start_connection(struct ocp_sock *s, ip_addr_t *ipaddr)
 		tpcb->keep_idle = tpcb->keep_intvl;
 	}
 
-	err = tcp_connect(tpcb, ipaddr, s->rport, connect_cb);
+	/* Use appropriate callback based on connection type */
+	connected_cb = (s->conn_type == CONN_TYPE_HTTP) ? http_connect_cb : connect_cb;
+
+	err = tcp_connect(tpcb, ipaddr, s->rport, connected_cb);
 	if (err != ERR_OK)
 		warn("%s: tcp_connect() returned %d\n", __func__, (int)err);
 }
@@ -563,6 +719,8 @@ static void finish_resolution(const char *hostname, ip_addr_t *ipaddr, void *arg
 	/* DNS resolution failed */
 	if (s->conn_type == CONN_TYPE_SOCKS)
 		socks_reply(s, SOCKS_HOST_UNREACHABLE);
+	else if (s->conn_type == CONN_TYPE_HTTP)
+		http_send_error(s, "502 Bad Gateway", "Host not found");
 	else
 		ocp_sock_del(s);
 }
@@ -627,9 +785,17 @@ static void new_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
 			struct sockaddr *address, int socklen, void *ctx)
 {
 	struct ocp_sock *lsock = ctx, *s;
+	event_callback_fn cb;
 
-	s = ocp_sock_new(fd, lsock->conn_type == CONN_TYPE_REDIR ?
-			 local_data_cb : socks_cmd_cb, 0);
+	/* Select the appropriate callback based on connection type */
+	if (lsock->conn_type == CONN_TYPE_REDIR)
+		cb = local_data_cb;
+	else if (lsock->conn_type == CONN_TYPE_HTTP)
+		cb = http_req_cb;
+	else
+		cb = socks_cmd_cb;
+
+	s = ocp_sock_new(fd, cb, 0);
 	if (!s) {
 		warn("too many connections\n");
 		return;
@@ -641,6 +807,9 @@ static void new_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	if (s->conn_type == CONN_TYPE_REDIR) {
 		s->rport = lsock->rport;
 		start_resolution(s, lsock->rhost_name);
+	} else if (s->conn_type == CONN_TYPE_HTTP) {
+		s->state = STATE_HTTP_REQ;
+		event_add(s->ev, NULL);
 	} else {
 		s->state = STATE_SOCKS_AUTH;
 		event_add(s->ev, NULL);
@@ -893,6 +1062,25 @@ static struct ocp_sock *dyn_fwd(const char *arg)
 	return s;
 }
 
+static struct ocp_sock *http_proxy(const char *arg)
+{
+	struct ocp_sock *s;
+	const char *sep = strrchr(arg, ':');
+
+	if (sep) {
+		/* <addr>:<port> format */
+		s = new_listener(ocp_atoi(sep + 1), new_conn_cb);
+		s->bind_addr = xstrdup(arg);
+		s->bind_addr[sep - arg] = 0;
+	} else {
+		/* <port> only */
+		s = new_listener(ocp_atoi(arg), new_conn_cb);
+	}
+
+	s->conn_type = CONN_TYPE_HTTP;
+	return s;
+}
+
 static struct option longopts[] = {
 	{ "ip",			1,	NULL,	'I' },
 	{ "mtu",		1,	NULL,	'M' },
@@ -900,6 +1088,7 @@ static struct option longopts[] = {
 	{ "domain",		1,	NULL,	'o' },
 	{ "localfw",		1,	NULL,	'L' },
 	{ "dynfw",		1,	NULL,	'D' },
+	{ "httpproxy",		1,	NULL,	'H' },
 	{ "keepalive",		1,	NULL,	'k' },
 	{ "allow-remote",	0,	NULL,	'g' },
 	{ "verbose",		0,	NULL,	'v' },
@@ -949,7 +1138,7 @@ int main(int argc, char **argv)
 
 	/* override with command line options */
 	while ((opt = getopt_long(argc, argv,
-				  "I:M:d:o:D:k:gL:vT", longopts, NULL)) != -1) {
+				  "I:M:d:o:D:H:k:gL:vT", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'I':
 			ip_str = optarg;
@@ -965,6 +1154,9 @@ int main(int argc, char **argv)
 			break;
 		case 'D':
 			s = dyn_fwd(optarg);
+			break;
+		case 'H':
+			s = http_proxy(optarg);
 			break;
 		case 'k':
 			keep_intvl = ocp_atoi(optarg);
