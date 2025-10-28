@@ -35,6 +35,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -191,6 +192,8 @@ static int keep_intvl;
 static int got_sighup;
 static int got_sigusr1;
 static char *dns_domain;
+static FILE *logfile;
+static char *logfile_path;
 
 static void start_connection(struct ocp_sock *s, ip_addr_t *ipaddr);
 static void start_resolution(struct ocp_sock *s, const char *hostname);
@@ -240,6 +243,65 @@ static void warn(const char *fmt, ...)
 	fprintf(stderr, "warning: ");
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
+}
+
+/* Get current timestamp in ISO 8601 format */
+static void get_timestamp(char *buf, size_t len)
+{
+	time_t now;
+	struct tm *tm_info;
+
+	time(&now);
+	tm_info = localtime(&now);
+	strftime(buf, len, "%Y-%m-%d %H:%M:%S", tm_info);
+}
+
+/* Log connection request */
+static void log_request(const char *protocol, const char *destination, int port)
+{
+	char timestamp[64];
+
+	if (!logfile)
+		return;
+
+	get_timestamp(timestamp, sizeof(timestamp));
+	fprintf(logfile, "[%s] %s -> %s:%d\n", timestamp, protocol, destination, port);
+	fflush(logfile);
+}
+
+/* Log HTTP/HTTPS request with full URL */
+static void log_http_request(const char *method, const char *url, const char *host, int port)
+{
+	char timestamp[64];
+	char full_url[2048];
+
+	if (!logfile)
+		return;
+
+	get_timestamp(timestamp, sizeof(timestamp));
+	
+	/* Construct full URL */
+	if (strcasecmp(method, "CONNECT") == 0) {
+		/* HTTPS tunneling */
+		snprintf(full_url, sizeof(full_url), "https://%s:%d/", host, port);
+		fprintf(logfile, "[%s] HTTPS CONNECT -> %s\n", timestamp, full_url);
+	} else {
+		/* Regular HTTP request */
+		if (strncasecmp(url, "http://", 7) == 0) {
+			/* Absolute URL */
+			fprintf(logfile, "[%s] HTTP %s -> %s\n", timestamp, method, url);
+		} else {
+			/* Relative URL - construct full URL */
+			const char *scheme = (port == 443) ? "https" : "http";
+			if (port == 80 || port == 443) {
+				snprintf(full_url, sizeof(full_url), "%s://%s%s", scheme, host, url);
+			} else {
+				snprintf(full_url, sizeof(full_url), "%s://%s:%d%s", scheme, host, port, url);
+			}
+			fprintf(logfile, "[%s] HTTP %s -> %s\n", timestamp, method, full_url);
+		}
+	}
+	fflush(logfile);
 }
 
 static char *xstrdup(const char *s)
@@ -484,6 +546,12 @@ static void socks_cmd_cb(evutil_socket_t fd, short what, void *ctx)
 				goto req_more;
 			ip.addr = req->u.ipv4.dst_addr;
 			s->rport = ntohs(req->u.ipv4.dst_port);
+			
+			/* Log SOCKS connection to IPv4 address */
+			char ip_str[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &ip.addr, ip_str, sizeof(ip_str));
+			log_request("SOCKS5", ip_str, s->rport);
+			
 			start_connection(s, &ip);
 			return;
 		} else if (req->atyp == SOCKS_ATYP_DOMAIN) {
@@ -498,6 +566,10 @@ static void socks_cmd_cb(evutil_socket_t fd, short what, void *ctx)
 				goto req_more;
 			s->rport = (name[namelen] << 8) | name[namelen + 1];
 			name[namelen] = 0;
+			
+			/* Log SOCKS connection to domain */
+			log_request("SOCKS5", (char *)name, s->rport);
+			
 			start_resolution(s, (char *)name);
 			return;
 		} else {
@@ -681,7 +753,6 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 	char *headers_end, *method, *url, *host_start, *port_str, *path_start;
 	char hostname[256];
 	char *host_header;
-	int is_connect = 0;
 	ip_addr_t ip;
 
 	if (s->state == STATE_DATA) {
@@ -747,7 +818,6 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 
 	/* Check if this is a CONNECT request */
 	if (strcasecmp(method, "CONNECT") == 0) {
-		is_connect = 1;
 		host_start = url;
 	} else {
 		/* Regular HTTP request (GET, POST, PUT, DELETE, etc.) */
@@ -763,9 +833,9 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 			}
 		} else {
 			/* Relative URL - need to find Host header */
-			free(request_copy);
 			host_header = strcasestr(s->sockbuf, "\r\nHost:");
 			if (!host_header) {
+				free(request_copy);
 				http_send_error(s, "400 Bad Request", "Missing Host header");
 				return;
 			}
@@ -775,12 +845,14 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 			
 			char *host_end = strstr(host_header, "\r\n");
 			if (!host_end) {
+				free(request_copy);
 				http_send_error(s, "400 Bad Request", "Invalid Host header");
 				return;
 			}
 			
 			int host_len = host_end - host_header;
 			if (host_len >= sizeof(hostname)) {
+				free(request_copy);
 				http_send_error(s, "400 Bad Request", "Host header too long");
 				return;
 			}
@@ -801,6 +873,7 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 			int req_len = headers_end - s->sockbuf + 4;
 			s->http_request = malloc(req_len + 1);
 			if (!s->http_request) {
+				free(request_copy);
 				http_send_error(s, "500 Internal Server Error", "Out of memory");
 				return;
 			}
@@ -808,6 +881,11 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 			s->http_request[req_len] = '\0';
 			s->http_request_len = req_len;
 			s->http_request_capacity = req_len + 1;
+
+			/* Log the HTTP request - url already contains the full path with query params */
+			log_http_request(method, url, hostname, s->rport);
+			
+			free(request_copy);
 
 			/* Check if it's an IP or hostname */
 			if (ipaddr_aton(hostname, &ip)) {
@@ -818,40 +896,27 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 			return;
 		}
 		
-		request_copy = xstrdup(s->sockbuf);
-		host_start = strstr(request_copy, "http://");
-		if (host_start) {
-			host_start += 7;
-			path_start = strchr(host_start, '/');
-			if (path_start)
-				*path_start = '\0';
+		/* For absolute URLs, extract the hostname for connection */
+		char *url_copy = xstrdup(url);
+		host_start = url_copy + 7; /* skip "http://" */
+		path_start = strchr(host_start, '/');
+		if (path_start)
+			*path_start = '\0';
+		
+		strncpy(hostname, host_start, sizeof(hostname) - 1);
+		hostname[sizeof(hostname) - 1] = '\0';
+		free(url_copy);
+		
+		/* Parse hostname:port from the extracted host */
+		port_str = strchr(hostname, ':');
+		if (port_str) {
+			*port_str++ = '\0';
+			s->rport = ocp_atoi(port_str);
 		} else {
-			free(request_copy);
-			http_send_error(s, "400 Bad Request", "Invalid URL");
-			return;
+			s->rport = 80;
 		}
-	}
 
-	/* Parse hostname:port */
-	port_str = strchr(host_start, ':');
-	if (port_str) {
-		*port_str++ = '\0';
-		s->rport = ocp_atoi(port_str);
-	} else {
-		s->rport = is_connect ? 443 : 80;
-	}
-
-	if (s->rport <= 0 || s->rport > 65535) {
-		free(request_copy);
-		http_send_error(s, "400 Bad Request", "Invalid port");
-		return;
-	}
-
-	strncpy(hostname, host_start, sizeof(hostname) - 1);
-	hostname[sizeof(hostname) - 1] = '\0';
-
-	/* For regular HTTP requests, store the request to forward */
-	if (s->http_relay_mode) {
+		/* Store the entire HTTP request to forward */
 		int req_len = headers_end - s->sockbuf + 4;
 		s->http_request = malloc(req_len + 1);
 		if (!s->http_request) {
@@ -863,7 +928,42 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 		s->http_request[req_len] = '\0';
 		s->http_request_len = req_len;
 		s->http_request_capacity = req_len + 1;
+
+		/* Log the HTTP request - url contains the full absolute URL */
+		log_http_request(method, url, hostname, s->rport);
+		
+		free(request_copy);
+
+		/* Check if it's an IP or hostname */
+		if (ipaddr_aton(hostname, &ip)) {
+			start_connection(s, &ip);
+		} else {
+			start_resolution(s, hostname);
+		}
+		return;
 	}
+
+	/* This code handles CONNECT requests only (is_connect == 1) */
+	/* Parse hostname:port from CONNECT target */
+	port_str = strchr(host_start, ':');
+	if (port_str) {
+		*port_str++ = '\0';
+		s->rport = ocp_atoi(port_str);
+	} else {
+		s->rport = 443; /* default HTTPS port for CONNECT */
+	}
+
+	if (s->rport <= 0 || s->rport > 65535) {
+		free(request_copy);
+		http_send_error(s, "400 Bad Request", "Invalid port");
+		return;
+	}
+
+	strncpy(hostname, host_start, sizeof(hostname) - 1);
+	hostname[sizeof(hostname) - 1] = '\0';
+
+	/* Log the HTTPS CONNECT request */
+	log_http_request(method, url, hostname, s->rport);
 
 	free(request_copy);
 
@@ -1064,6 +1164,10 @@ static void new_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
 
 	if (s->conn_type == CONN_TYPE_REDIR) {
 		s->rport = lsock->rport;
+		
+		/* Log port forwarding connection */
+		log_request("PORT-FWD", lsock->rhost_name, s->rport);
+		
 		start_resolution(s, lsock->rhost_name);
 	} else if (s->conn_type == CONN_TYPE_HTTP) {
 		s->state = STATE_HTTP_REQ;
@@ -1348,6 +1452,7 @@ static struct option longopts[] = {
 	{ "dynfw",		1,	NULL,	'D' },
 	{ "httpproxy",		1,	NULL,	'H' },
 	{ "keepalive",		1,	NULL,	'k' },
+	{ "logfile",		1,	NULL,	'l' },
 	{ "allow-remote",	0,	NULL,	'g' },
 	{ "verbose",		0,	NULL,	'v' },
 	{ "tcpdump",		0,	NULL,	'T' },
@@ -1396,7 +1501,7 @@ int main(int argc, char **argv)
 
 	/* override with command line options */
 	while ((opt = getopt_long(argc, argv,
-				  "I:M:d:o:D:H:k:gL:vT", longopts, NULL)) != -1) {
+				  "I:M:d:o:D:H:k:l:gL:vT", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'I':
 			ip_str = optarg;
@@ -1418,6 +1523,9 @@ int main(int argc, char **argv)
 			break;
 		case 'k':
 			keep_intvl = ocp_atoi(optarg);
+			break;
+		case 'l':
+			logfile_path = xstrdup(optarg);
 			break;
 		case 'g':
 			allow_remote = 1;
@@ -1443,6 +1551,22 @@ int main(int argc, char **argv)
 
 	if (!ipaddr_aton(ip_str, &ip))
 		die("Invalid IP address: '%s'\n", ip_str);
+
+	/* Open log file if specified */
+	if (logfile_path) {
+		logfile = fopen(logfile_path, "a");
+		if (!logfile) {
+			warn("Failed to open log file '%s': %s\n", 
+			     logfile_path, strerror(errno));
+			logfile_path = NULL;
+		} else {
+			/* Write log header */
+			char timestamp[64];
+			get_timestamp(timestamp, sizeof(timestamp));
+			fprintf(logfile, "\n=== ocproxy started at %s ===\n", timestamp);
+			fflush(logfile);
+		}
+	}
 
 	/* Debugging help. */
 	signal(SIGHUP, handle_sig);
@@ -1485,6 +1609,15 @@ int main(int argc, char **argv)
 	new_periodic_event(cb_housekeeping, &vpnfd, 1000);
 
 	event_base_dispatch(event_base);
+
+	/* Close log file on exit */
+	if (logfile) {
+		char timestamp[64];
+		get_timestamp(timestamp, sizeof(timestamp));
+		fprintf(logfile, "=== ocproxy stopped at %s ===\n\n", timestamp);
+		fclose(logfile);
+		logfile = NULL;
+	}
 
 	return 0;
 }

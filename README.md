@@ -16,6 +16,7 @@ Commonly used options include:
       -H port                   Set up an HTTP proxy server on PORT
       -L lport:rhost:rport      Connections to localhost:LPORT will be redirected
                                 over the VPN to RHOST:RPORT
+      -l file, --logfile file   Log all proxy requests to FILE
       -g                        Allow non-local clients.
       -k interval               Send TCP keepalive every INTERVAL seconds, to
                                 prevent connection timeouts
@@ -44,6 +45,34 @@ SOCKS or HTTP proxy servers:
     ...
 
 OpenConnect can (and should) be run as a non-root user when using ocproxy.
+
+
+Logging
+-------
+
+ocproxy can log all proxy requests to a file using the `-l` or `--logfile` option:
+
+    openconnect --script-tun --script \
+        "./ocproxy -H 8080 -D 11080 -l /var/log/ocproxy.log" \
+        vpn.example.com
+
+The log file will contain timestamped entries for all connection requests through the proxy:
+
+**Log format examples:**
+
+    [2025-01-15 14:23:45] HTTP GET -> http://example.com/page.html
+    [2025-01-15 14:23:46] HTTPS CONNECT -> https://secure.example.com:443/
+    [2025-01-15 14:23:47] SOCKS5 -> mail.example.com:993
+    [2025-01-15 14:23:48] PORT-FWD -> internal-server:22
+
+The log includes:
+- **Timestamp** in format `YYYY-MM-DD HH:MM:SS`
+- **Protocol type**: HTTP, HTTPS, SOCKS5, or PORT-FWD
+- **HTTP method** for HTTP requests (GET, POST, PUT, DELETE, etc.)
+- **Full URL** for HTTP/HTTPS requests
+- **Destination hostname/IP and port** for all connection types
+
+The log file is opened in append mode, so logs persist across multiple ocproxy sessions.
 
 
 Using the HTTP proxy
