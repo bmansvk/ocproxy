@@ -1443,6 +1443,41 @@ static struct ocp_sock *http_proxy(const char *arg)
 	return s;
 }
 
+static void print_help(const char *progname)
+{
+	printf("Usage: %s [OPTIONS]\n\n", progname);
+	printf("ocproxy - Cisco AnyConnect compatible proxy server\n\n");
+	printf("Options:\n");
+	printf("  -I, --ip ADDRESS        Set the IP address for the TUN interface\n");
+	printf("  -M, --mtu SIZE          Set the MTU size\n");
+	printf("  -d, --dns ADDRESS       Set the DNS server address\n");
+	printf("  -o, --domain DOMAIN     Set the DNS domain for unqualified hostnames\n");
+	printf("  -L, --localfw SPEC      Add local port forward (format: localport:remotehost:remoteport)\n");
+	printf("  -D, --dynfw PORT        Enable SOCKS5 proxy on specified port (format: [addr:]port)\n");
+	printf("  -H, --httpproxy PORT    Enable HTTP proxy on specified port (format: [addr:]port)\n");
+	printf("  -k, --keepalive SEC     Set TCP keepalive interval in seconds\n");
+	printf("  -l, --logfile PATH      Log all connections to specified file\n");
+	printf("  -g, --allow-remote      Allow remote connections (default: localhost only)\n");
+	printf("  -v, --verbose           Enable verbose debug output\n");
+	printf("  -T, --tcpdump           Enable tcpdump-style packet logging\n");
+	printf("  -h, --help              Display this help message and exit\n");
+	printf("\n");
+	printf("Environment variables:\n");
+	printf("  VPNFD                   File descriptor for VPN connection (required)\n");
+	printf("  INTERNAL_IP4_ADDRESS    IPv4 address (can be overridden with -I)\n");
+	printf("  INTERNAL_IP4_MTU        MTU size (can be overridden with -M)\n");
+	printf("  INTERNAL_IP4_DNS        DNS server address (can be overridden with -d)\n");
+	printf("  CISCO_DEF_DOMAIN        DNS domain (can be overridden with -o)\n");
+	printf("\n");
+	printf("Examples:\n");
+	printf("  # SOCKS5 proxy on port 1080\n");
+	printf("  %s -D 1080\n\n", progname);
+	printf("  # HTTP proxy on port 8080 with logging\n");
+	printf("  %s -H 8080 -l /var/log/ocproxy.log\n\n", progname);
+	printf("  # Port forward local 2222 to remote ssh server\n");
+	printf("  %s -L 2222:server.example.com:22\n\n", progname);
+}
+
 static struct option longopts[] = {
 	{ "ip",			1,	NULL,	'I' },
 	{ "mtu",		1,	NULL,	'M' },
@@ -1456,12 +1491,13 @@ static struct option longopts[] = {
 	{ "allow-remote",	0,	NULL,	'g' },
 	{ "verbose",		0,	NULL,	'v' },
 	{ "tcpdump",		0,	NULL,	'T' },
+	{ "help",		0,	NULL,	'h' },
 	{ NULL }
 };
 
 int main(int argc, char **argv)
 {
-	int opt, i, vpnfd;
+	int opt, i, vpnfd = -1;
 	char *str;
 	char *ip_str, *mtu_str, *dns_str;
 	ip_addr_t ip, netmask, gw, dns;
@@ -1469,6 +1505,14 @@ int main(int argc, char **argv)
 	struct netif netif;
 
 	ip_str = mtu_str = dns_str = NULL;
+
+	/* Check for help option first, before any initialization */
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+			print_help(argv[0]);
+			exit(0);
+		}
+	}
 
 	ocp_sock_free_list = &ocp_sock_pool[0];
 	for (i = 1; i < MAX_CONN; i++)
@@ -1501,7 +1545,7 @@ int main(int argc, char **argv)
 
 	/* override with command line options */
 	while ((opt = getopt_long(argc, argv,
-				  "I:M:d:o:D:H:k:l:gL:vT", longopts, NULL)) != -1) {
+				  "I:M:d:o:D:H:k:l:gL:vTh", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'I':
 			ip_str = optarg;
@@ -1541,8 +1585,12 @@ int main(int argc, char **argv)
 		case 'T':
 			tcpdump_enabled = 1;
 			break;
+		case 'h':
+			print_help(argv[0]);
+			exit(0);
 		default:
-			die("unknown option: %c\n", opt);
+			print_help(argv[0]);
+			exit(1);
 		}
 	}
 
