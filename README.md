@@ -49,7 +49,10 @@ OpenConnect can (and should) be run as a non-root user when using ocproxy.
 Using the HTTP proxy
 ---------------------
 
-The HTTP proxy supports the CONNECT method for tunneling HTTPS connections.
+The HTTP proxy supports both regular HTTP methods (GET, POST, PUT, DELETE, etc.)
+and the CONNECT method for tunneling HTTPS connections. This provides full
+HTTP/HTTPS proxy functionality.
+
 You can configure your browser or other applications to use the HTTP proxy
 for both HTTP and HTTPS connections.
 
@@ -59,6 +62,13 @@ To configure the HTTP proxy in your browser:
 
 The HTTP proxy can be used alongside the SOCKS5 proxy. Some applications
 may work better with HTTP proxy (browsers), while others may prefer SOCKS5.
+
+Supported features:
+- Full HTTP/1.x proxy with all standard methods (GET, POST, PUT, DELETE, HEAD, OPTIONS, etc.)
+- HTTPS tunneling via CONNECT method
+- Both absolute URLs (http://host/path) and relative URLs with Host header
+- Automatic DNS resolution for hostnames
+- HTTP keep-alive connections
 
 
 Using the SOCKS5 proxy
@@ -109,11 +119,31 @@ Dependencies:
  * automake
  * gcc, binutils, make, etc.
 
-Building from git:
+Building from git on Linux:
 
     ./autogen.sh
     ./configure
     make
+
+Building from git on macOS:
+
+First, install dependencies using Homebrew:
+
+    brew install libevent automake autoconf
+
+Then build with the correct library paths:
+
+    ./autogen.sh
+    ./configure \
+      CPPFLAGS="-I/opt/homebrew/opt/libevent/include" \
+      LDFLAGS="-L/opt/homebrew/opt/libevent/lib"
+    make
+
+Note: For Intel Macs, use `/usr/local` instead of `/opt/homebrew`:
+
+    ./configure \
+      CPPFLAGS="-I/usr/local/opt/libevent/include" \
+      LDFLAGS="-L/usr/local/opt/libevent/lib"
 
 
 Other possible uses for ocproxy

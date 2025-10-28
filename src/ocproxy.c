@@ -62,6 +62,8 @@ enum {
 	STATE_SOCKS_AUTH,
 	STATE_SOCKS_CMD,
 	STATE_HTTP_REQ,
+	STATE_HTTP_HEADERS,
+	STATE_HTTP_RELAY,
 	STATE_DNS,
 	STATE_CONNECTING,
 	STATE_DATA,
@@ -130,6 +132,12 @@ struct ocp_sock {
 
 	/* for lwip_data_cb() */
 	struct netif *netif;
+
+	/* for HTTP proxy */
+	int http_relay_mode;
+	char *http_request;
+	int http_request_len;
+	int http_request_capacity;
 };
 
 struct socks_auth {
@@ -190,6 +198,27 @@ static void start_resolution(struct ocp_sock *s, const char *hostname);
 /**********************************************************************
  * Utility functions / libevent wrappers
  **********************************************************************/
+
+/* Portable strcasestr for systems that don't have it */
+#ifndef __APPLE__
+#ifndef __GLIBC__
+static char *strcasestr(const char *haystack, const char *needle)
+{
+	size_t needle_len = strlen(needle);
+	if (needle_len == 0)
+		return (char *)haystack;
+	
+	for (; *haystack; haystack++) {
+		if (strncasecmp(haystack, needle, needle_len) == 0)
+			return (char *)haystack;
+	}
+	return NULL;
+}
+#endif
+#endif
+
+static void die(const char *fmt, ...) __attribute__((format(printf, 1, 2))) __attribute__((noreturn));
+static void warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void die(const char *fmt, ...)
 {
@@ -272,6 +301,10 @@ static void ocp_sock_del(struct ocp_sock *s)
 		tcp_close(s->tpcb);
 	}
 	event_free(s->ev);
+	if (s->http_request) {
+		free(s->http_request);
+		s->http_request = NULL;
+	}
 	memset(s, 0xdd, sizeof(*s));
 	s->next = ocp_sock_free_list;
 	ocp_sock_free_list = s;
@@ -518,6 +551,79 @@ static void http_send_connect_ok(struct ocp_sock *s)
 	tcp_sent(s->tpcb, sent_cb);
 }
 
+/* Called when lwIP has data from target for HTTP relay mode */
+static err_t http_relay_recv_cb(void *ctx, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+	struct ocp_sock *s = ctx;
+	struct pbuf *first = p;
+	int offset;
+	ssize_t wlen;
+
+	if (!s)
+		return ERR_ABRT;
+
+	if (!p) {
+		ocp_sock_del(s);
+		return ERR_OK;
+	}
+
+	/* Send response data back to client */
+	for (offset = s->done_len; p && offset >= p->len; offset -= p->len)
+		p = p->next;
+
+	for (; p; p = p->next) {
+		int try_len = p->len - offset;
+
+		wlen = write(s->fd, (char *)p->payload + offset, try_len);
+		offset = 0;
+
+		if (wlen < 0) {
+			ocp_sock_del(s);
+			return ERR_ABRT;
+		}
+		s->done_len += wlen;
+		tcp_recved(tpcb, wlen);
+		if (wlen < try_len)
+			return ERR_WOULDBLOCK;
+	}
+
+	s->done_len = 0;
+	pbuf_free(first);
+
+	return ERR_OK;
+}
+
+/* Called when client sends data in HTTP relay mode */
+static void http_relay_local_cb(evutil_socket_t fd, short what, void *ctx)
+{
+	struct ocp_sock *s = ctx;
+	ssize_t len;
+	int try_len;
+	err_t err;
+
+	try_len = tcp_sndbuf(s->tpcb);
+	if (try_len > SOCKBUF_LEN)
+		try_len = SOCKBUF_LEN;
+	if (!try_len || tcp_sndqueuelen(s->tpcb) > (TCP_SND_QUEUELEN/2)) {
+		s->lwip_blocked = 1;
+		return;
+	}
+
+	len = read(s->fd, s->sockbuf, try_len);
+	if (len <= 0) {
+		ocp_sock_del(s);
+		return;
+	}
+	err = tcp_write(s->tpcb, s->sockbuf, len, TCP_WRITE_FLAG_COPY);
+	if (err == ERR_MEM)
+		die("%s: out of memory\n", __func__);
+	else if (err != ERR_OK)
+		warn("tcp_write returned %d\n", (int)err);
+
+	tcp_output(s->tpcb);
+	event_add(s->ev, NULL);
+}
+
 /* Called when lwIP tcp_connect() is successful for HTTP CONNECT */
 static err_t http_connect_cb(void *arg, struct tcp_pcb *tpcb, err_t err)
 {
@@ -527,17 +633,66 @@ static err_t http_connect_cb(void *arg, struct tcp_pcb *tpcb, err_t err)
 	return ERR_OK;
 }
 
+/* Called when lwIP tcp_connect() is successful for HTTP relay mode */
+static err_t http_relay_connect_cb(void *arg, struct tcp_pcb *tpcb, err_t err)
+{
+	struct ocp_sock *s = arg;
+	err_t write_err;
+
+	if (!s || !s->http_request)
+		return ERR_ABRT;
+
+	/* Connection established, send the HTTP request to target server */
+	write_err = tcp_write(tpcb, s->http_request, s->http_request_len, TCP_WRITE_FLAG_COPY);
+	if (write_err == ERR_MEM) {
+		warn("%s: out of memory sending HTTP request\n", __func__);
+		ocp_sock_del(s);
+		return ERR_ABRT;
+	} else if (write_err != ERR_OK) {
+		warn("tcp_write returned %d\n", (int)write_err);
+		ocp_sock_del(s);
+		return ERR_ABRT;
+	}
+
+	tcp_output(tpcb);
+
+	/* Free the request buffer */
+	free(s->http_request);
+	s->http_request = NULL;
+	s->http_request_len = 0;
+	s->http_request_capacity = 0;
+
+	/* Now relay responses and further requests */
+	s->state = STATE_HTTP_RELAY;
+	event_del(s->ev);
+	event_free(s->ev);
+	s->ev = event_new(event_base, s->fd, EV_READ, http_relay_local_cb, s);
+	event_add(s->ev, NULL);
+	tcp_recv(tpcb, http_relay_recv_cb);
+	tcp_sent(tpcb, sent_cb);
+
+	return ERR_OK;
+}
+
 static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 {
 	struct ocp_sock *s = ctx;
 	ssize_t ret;
-	char *line_end, *method, *url, *host_start, *port_str;
+	char *headers_end, *method, *url, *host_start, *port_str, *path_start;
 	char hostname[256];
+	char *host_header;
 	int is_connect = 0;
+	ip_addr_t ip;
 
 	if (s->state == STATE_DATA) {
 		/* HTTP CONNECT tunnel established, pass data */
 		local_data_cb(fd, what, ctx);
+		return;
+	}
+
+	if (s->state == STATE_HTTP_RELAY) {
+		/* HTTP relay mode active */
+		http_relay_local_cb(fd, what, ctx);
 		return;
 	}
 
@@ -548,9 +703,9 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 	s->sock_pos += ret;
 	s->sockbuf[s->sock_pos] = '\0';
 
-	/* Look for end of HTTP request line */
-	line_end = strstr(s->sockbuf, "\r\n");
-	if (!line_end) {
+	/* Look for end of HTTP headers */
+	headers_end = strstr(s->sockbuf, "\r\n\r\n");
+	if (!headers_end) {
 		if (s->sock_pos >= SOCKBUF_LEN - 1) {
 			http_send_error(s, "400 Bad Request", "Request too long");
 			return;
@@ -559,69 +714,165 @@ static void http_req_cb(evutil_socket_t fd, short what, void *ctx)
 		return;
 	}
 
+	/* We have complete headers */
+	char *request_copy = xstrdup(s->sockbuf);
+	char *line_end = strstr(request_copy, "\r\n");
+	if (!line_end) {
+		free(request_copy);
+		http_send_error(s, "400 Bad Request", "Invalid request");
+		return;
+	}
 	*line_end = '\0';
 
 	/* Parse request: METHOD URL HTTP/1.x */
-	method = s->sockbuf;
+	method = request_copy;
 	url = strchr(method, ' ');
 	if (!url) {
+		free(request_copy);
 		http_send_error(s, "400 Bad Request", "Invalid request");
 		return;
 	}
 	*url++ = '\0';
 
-	/* Skip whitespace */
 	while (*url == ' ')
 		url++;
 
 	char *http_ver = strchr(url, ' ');
 	if (!http_ver) {
+		free(request_copy);
 		http_send_error(s, "400 Bad Request", "Invalid request");
 		return;
 	}
-	*http_ver = '\0';
+	*http_ver++ = '\0';
 
 	/* Check if this is a CONNECT request */
 	if (strcasecmp(method, "CONNECT") == 0) {
 		is_connect = 1;
-		/* CONNECT format: hostname:port */
 		host_start = url;
 	} else {
-		/* Regular HTTP request - not supported in this simple implementation */
-		http_send_error(s, "501 Not Implemented",
-				"Only CONNECT method is supported");
-		return;
+		/* Regular HTTP request (GET, POST, PUT, DELETE, etc.) */
+		s->http_relay_mode = 1;
+
+		/* Parse URL to extract host and port */
+		if (strncasecmp(url, "http://", 7) == 0) {
+			/* Absolute URL format: http://host:port/path */
+			host_start = url + 7;
+			path_start = strchr(host_start, '/');
+			if (path_start) {
+				*path_start = '\0';
+			}
+		} else {
+			/* Relative URL - need to find Host header */
+			free(request_copy);
+			host_header = strcasestr(s->sockbuf, "\r\nHost:");
+			if (!host_header) {
+				http_send_error(s, "400 Bad Request", "Missing Host header");
+				return;
+			}
+			host_header += 7; /* skip "\r\nHost:" */
+			while (*host_header == ' ' || *host_header == '\t')
+				host_header++;
+			
+			char *host_end = strstr(host_header, "\r\n");
+			if (!host_end) {
+				http_send_error(s, "400 Bad Request", "Invalid Host header");
+				return;
+			}
+			
+			int host_len = host_end - host_header;
+			if (host_len >= sizeof(hostname)) {
+				http_send_error(s, "400 Bad Request", "Host header too long");
+				return;
+			}
+			
+			memcpy(hostname, host_header, host_len);
+			hostname[host_len] = '\0';
+			
+			/* Parse hostname:port */
+			port_str = strchr(hostname, ':');
+			if (port_str) {
+				*port_str++ = '\0';
+				s->rport = ocp_atoi(port_str);
+			} else {
+				s->rport = 80; /* default HTTP port */
+			}
+
+			/* Store the entire HTTP request to forward */
+			int req_len = headers_end - s->sockbuf + 4;
+			s->http_request = malloc(req_len + 1);
+			if (!s->http_request) {
+				http_send_error(s, "500 Internal Server Error", "Out of memory");
+				return;
+			}
+			memcpy(s->http_request, s->sockbuf, req_len);
+			s->http_request[req_len] = '\0';
+			s->http_request_len = req_len;
+			s->http_request_capacity = req_len + 1;
+
+			/* Check if it's an IP or hostname */
+			if (ipaddr_aton(hostname, &ip)) {
+				start_connection(s, &ip);
+			} else {
+				start_resolution(s, hostname);
+			}
+			return;
+		}
+		
+		request_copy = xstrdup(s->sockbuf);
+		host_start = strstr(request_copy, "http://");
+		if (host_start) {
+			host_start += 7;
+			path_start = strchr(host_start, '/');
+			if (path_start)
+				*path_start = '\0';
+		} else {
+			free(request_copy);
+			http_send_error(s, "400 Bad Request", "Invalid URL");
+			return;
+		}
 	}
 
 	/* Parse hostname:port */
 	port_str = strchr(host_start, ':');
-	if (!port_str) {
-		http_send_error(s, "400 Bad Request", "Missing port in CONNECT");
-		return;
+	if (port_str) {
+		*port_str++ = '\0';
+		s->rport = ocp_atoi(port_str);
+	} else {
+		s->rport = is_connect ? 443 : 80;
 	}
-	*port_str++ = '\0';
 
-	/* Copy hostname */
-	strncpy(hostname, host_start, sizeof(hostname) - 1);
-	hostname[sizeof(hostname) - 1] = '\0';
-
-	/* Parse port */
-	s->rport = ocp_atoi(port_str);
 	if (s->rport <= 0 || s->rport > 65535) {
+		free(request_copy);
 		http_send_error(s, "400 Bad Request", "Invalid port");
 		return;
 	}
 
-	/* Check if it's an IP address or needs DNS resolution */
-	ip_addr_t ip;
-	if (ipaddr_aton(hostname, &ip)) {
-		/* Direct IP connection */
-		start_connection(s, &ip);
-	} else {
-		/* DNS resolution needed */
-		start_resolution(s, hostname);
+	strncpy(hostname, host_start, sizeof(hostname) - 1);
+	hostname[sizeof(hostname) - 1] = '\0';
+
+	/* For regular HTTP requests, store the request to forward */
+	if (s->http_relay_mode) {
+		int req_len = headers_end - s->sockbuf + 4;
+		s->http_request = malloc(req_len + 1);
+		if (!s->http_request) {
+			free(request_copy);
+			http_send_error(s, "500 Internal Server Error", "Out of memory");
+			return;
+		}
+		memcpy(s->http_request, s->sockbuf, req_len);
+		s->http_request[req_len] = '\0';
+		s->http_request_len = req_len;
+		s->http_request_capacity = req_len + 1;
 	}
 
+	free(request_copy);
+
+	/* Check if it's an IP address or needs DNS resolution */
+	if (ipaddr_aton(hostname, &ip)) {
+		start_connection(s, &ip);
+	} else {
+		start_resolution(s, hostname);
+	}
 	return;
 
 disconnect:
@@ -689,8 +940,15 @@ static void start_connection(struct ocp_sock *s, ip_addr_t *ipaddr)
 		tpcb->keep_idle = tpcb->keep_intvl;
 	}
 
-	/* Use appropriate callback based on connection type */
-	connected_cb = (s->conn_type == CONN_TYPE_HTTP) ? http_connect_cb : connect_cb;
+	/* Use appropriate callback based on connection type and mode */
+	if (s->conn_type == CONN_TYPE_HTTP) {
+		if (s->http_relay_mode)
+			connected_cb = http_relay_connect_cb;
+		else
+			connected_cb = http_connect_cb;
+	} else {
+		connected_cb = connect_cb;
+	}
 
 	err = tcp_connect(tpcb, ipaddr, s->rport, connected_cb);
 	if (err != ERR_OK)
